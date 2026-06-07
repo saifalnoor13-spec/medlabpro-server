@@ -1,70 +1,59 @@
 const { WebSocketServer, WebSocket } = require("ws");
 const http = require("http");
-const Database = require("better-sqlite3");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.SYNC_SECRET || "medlab-secret-change-me";
+const DB_PATH = path.join(__dirname, "medlab.json");
 
-// ─── Database ─────────────────────────────────────────────────────────────────
-const db = new Database("medlab.db");
+// ─── Simple JSON Database (بدل SQLite) ───────────────────────────────────────
+let store = { changes: {}, devices: {} };
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS changes (
-    id        TEXT PRIMARY KEY,
-    store     TEXT NOT NULL,
-    record_id TEXT NOT NULL,
-    data      TEXT,
-    deleted   INTEGER DEFAULT 0,
-    timestamp INTEGER NOT NULL,
-    device_id TEXT NOT NULL
-  );
+function loadDB() {
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      store = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+      if (!store.changes) store.changes = {};
+      if (!store.devices) store.devices = {};
+    }
+  } catch { store = { changes: {}, devices: {} }; }
+}
 
-  CREATE INDEX IF NOT EXISTS idx_changes_timestamp ON changes(timestamp);
-  CREATE INDEX IF NOT EXISTS idx_changes_store ON changes(store);
+function saveDB() {
+  try { fs.writeFileSync(DB_PATH, JSON.stringify(store)); } catch {}
+}
 
-  CREATE TABLE IF NOT EXISTS devices (
-    device_id   TEXT PRIMARY KEY,
-    name        TEXT,
-    last_seen   INTEGER
-  );
-`);
+function upsertChange(row) {
+  const existing = store.changes[row.id];
+  if (!existing || row.timestamp > existing.timestamp) {
+    store.changes[row.id] = row;
+    saveDB();
+    return true;
+  }
+  return false;
+}
 
-// ─── Prepared Statements ──────────────────────────────────────────────────────
-const stmts = {
-  upsertChange: db.prepare(`
-    INSERT INTO changes (id, store, record_id, data, deleted, timestamp, device_id)
-    VALUES (@id, @store, @record_id, @data, @deleted, @timestamp, @device_id)
-    ON CONFLICT(id) DO UPDATE SET
-      data      = excluded.data,
-      deleted   = excluded.deleted,
-      timestamp = excluded.timestamp,
-      device_id = excluded.device_id
-    WHERE excluded.timestamp > changes.timestamp
-  `),
+function getChangesSince(since) {
+  return Object.values(store.changes)
+    .filter(c => c.timestamp > since)
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .slice(0, 1000);
+}
 
-  getChangesSince: db.prepare(`
-    SELECT * FROM changes WHERE timestamp > ? ORDER BY timestamp ASC LIMIT 1000
-  `),
-
-  upsertDevice: db.prepare(`
-    INSERT INTO devices (device_id, name, last_seen)
-    VALUES (@device_id, @name, @last_seen)
-    ON CONFLICT(device_id) DO UPDATE SET name = excluded.name, last_seen = excluded.last_seen
-  `),
-};
+loadDB();
+console.log(`📦 Loaded ${Object.keys(store.changes).length} changes from DB`);
 
 // ─── HTTP Server ──────────────────────────────────────────────────────────────
 const httpServer = http.createServer((req, res) => {
   if (req.url === "/health") {
-    const deviceCount = db.prepare("SELECT COUNT(*) as c FROM devices").get().c;
-    const changeCount = db.prepare("SELECT COUNT(*) as c FROM changes").get().c;
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
-      devices: deviceCount,
-      changes: changeCount,
+      devices: Object.keys(store.devices).length,
+      changes: Object.keys(store.changes).length,
       uptime: Math.floor(process.uptime()),
       time: Date.now()
     }));
@@ -76,8 +65,6 @@ const httpServer = http.createServer((req, res) => {
 
 // ─── WebSocket Server ─────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ server: httpServer });
-
-// Map: device_id → ws
 const clients = new Map();
 
 function broadcast(data, excludeDeviceId = null) {
@@ -97,38 +84,24 @@ wss.on("connection", (ws, req) => {
 
   ws.on("message", (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw);
-    } catch {
+    try { msg = JSON.parse(raw); } catch {
       ws.send(JSON.stringify({ type: "error", message: "Invalid JSON" }));
       return;
     }
 
-    // ── AUTH ──────────────────────────────────────────────────────────────────
     if (msg.type === "auth") {
       if (msg.secret !== SECRET) {
         ws.send(JSON.stringify({ type: "auth_failed" }));
         ws.close();
         return;
       }
-
       deviceId = msg.device_id || crypto.randomUUID();
       authenticated = true;
       clients.set(deviceId, ws);
-
-      stmts.upsertDevice.run({
-        device_id: deviceId,
-        name: msg.device_name || "Unknown",
-        last_seen: Date.now(),
-      });
-
+      store.devices[deviceId] = { name: msg.device_name || "Unknown", last_seen: Date.now() };
+      saveDB();
       console.log(`[✓] Auth: ${msg.device_name || deviceId}`);
-
-      ws.send(JSON.stringify({
-        type: "auth_ok",
-        device_id: deviceId,
-        server_time: Date.now(),
-      }));
+      ws.send(JSON.stringify({ type: "auth_ok", device_id: deviceId, server_time: Date.now() }));
       return;
     }
 
@@ -137,55 +110,37 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // ── PULL ──────────────────────────────────────────────────────────────────
     if (msg.type === "pull") {
-      const since = msg.since || 0;
-      const changes = stmts.getChangesSince.all(since);
-
-      ws.send(JSON.stringify({
-        type: "pull_response",
-        changes,
-        server_time: Date.now(),
-      }));
+      const changes = getChangesSince(msg.since || 0);
+      ws.send(JSON.stringify({ type: "pull_response", changes, server_time: Date.now() }));
       return;
     }
 
-    // ── PUSH ──────────────────────────────────────────────────────────────────
     if (msg.type === "push") {
       const { changes } = msg;
       if (!Array.isArray(changes) || changes.length === 0) return;
-
       const saved = [];
-      const pushMany = db.transaction(() => {
-        for (const c of changes) {
-          if (!c.store || !c.record_id) continue;
-          const row = {
-            id: c.id || `${c.store}:${c.record_id}:${Date.now()}`,
-            store: c.store,
-            record_id: c.record_id,
-            data: typeof c.data === "string" ? c.data : JSON.stringify(c.data),
-            deleted: c.deleted ? 1 : 0,
-            timestamp: c.timestamp || Date.now(),
-            device_id: deviceId,
-          };
-          stmts.upsertChange.run(row);
-          saved.push(row);
-        }
-      });
-      pushMany();
-
-      // Confirm to sender
+      for (const c of changes) {
+        if (!c.store || !c.record_id) continue;
+        const row = {
+          id: c.id || `${c.store}:${c.record_id}:${Date.now()}`,
+          store: c.store,
+          record_id: c.record_id,
+          data: typeof c.data === "string" ? c.data : JSON.stringify(c.data),
+          deleted: c.deleted ? 1 : 0,
+          timestamp: c.timestamp || Date.now(),
+          device_id: deviceId,
+        };
+        if (upsertChange(row)) saved.push(row);
+      }
       ws.send(JSON.stringify({ type: "push_ack", count: saved.length }));
-
-      // Broadcast to all other devices
       if (saved.length > 0) {
         broadcast({ type: "changes", changes: saved }, deviceId);
-        console.log(`[→] ${deviceId} pushed ${saved.length} changes → broadcast`);
+        console.log(`[→] ${deviceId} pushed ${saved.length} changes`);
       }
       return;
     }
 
-    // ── PING ─────────────────────────────────────────────────────────────────
     if (msg.type === "ping") {
       ws.send(JSON.stringify({ type: "pong", time: Date.now() }));
       return;
@@ -193,19 +148,15 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
-    if (deviceId) {
-      clients.delete(deviceId);
-      console.log(`[-] Disconnected: ${deviceId}`);
-    }
+    if (deviceId) { clients.delete(deviceId); console.log(`[-] Disconnected: ${deviceId}`); }
   });
 
-  ws.on("error", (err) => {
-    console.error(`[!] WS Error (${deviceId}):`, err.message);
-  });
+  ws.on("error", (err) => console.error(`[!] WS Error:`, err.message));
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 httpServer.listen(PORT, () => {
   console.log(`✅ MedLab Sync Server running on port ${PORT}`);
-  console.log(`🔑 Secret: ${SECRET}`);
 });
+
+setInterval(() => saveDB(), 60000);
